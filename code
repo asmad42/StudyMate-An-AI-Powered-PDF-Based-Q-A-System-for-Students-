@@ -1,1 +1,103 @@
+import streamlit as st
+import fitz  # PyMuPDF
+from sentence_transformers import SentenceTransformer
+import numpy as np
+import faiss
+from transformers import pipeline
+import torch  # added
+
+st.title("StudyMate: An AI-Powered PDF-Based Q&A System for Students ")
+
+uploaded_file = st.file_uploader("Upload your PDF file", type=["pdf"])
+question = st.text_input("Ask a question about the document:")
+
+
+def extract_text_with_metadata(pdf_bytes):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    texts = []
+    for i, page in enumerate(doc):
+        text = page.get_text()
+        texts.append(f"Page {i+1}:\n{text}")
+    metadata = doc.metadata
+    metadata_str = "\n".join(f"{k}: {v}" for k, v in metadata.items() if v)
+    return "\n\n".join(texts), metadata_str
+
+
+def chunk_text_with_overlap(text, chunk_size=500, overlap=50):
+    chunks = []
+    start = 0
+    text_length = len(text)
+    while start < text_length:
+        end = min(start + chunk_size, text_length)
+        chunk = text[start:end]
+        chunks.append(chunk)
+        start += chunk_size - overlap
+    return chunks
+
+
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+
+def embed_chunks(chunks):
+    embeddings = model.encode(chunks)
+    return embeddings.astype('float32')
+
+
+def build_faiss_index(embeddings):
+    index = faiss.IndexFlatL2(embeddings.shape[1])
+    index.add(embeddings)
+    return index
+
+
+def get_relevant_chunks(question, chunks, embeddings, index, top_k=3):
+    q_emb = model.encode([question]).astype('float32')
+    _, I = index.search(q_emb, top_k)
+    return [chunks[i] for i in I[0]]
+
+
+# Fix for meta tensor error by forcing model loading on CPU or appropriate device
+device = 0 if torch.cuda.is_available() else -1
+
+generator = pipeline('text-generation', model='EleutherAI/gpt-neo-125M', device=device)
+summarizer = pipeline('summarization', model='facebook/bart-large-cnn', device=device)
+keyword_extractor = pipeline('feature-extraction', model='distilbert-base-uncased', device=device)
+
+
+if uploaded_file:
+    pdf_bytes = uploaded_file.read()
+    full_text, metadata_str = extract_text_with_metadata(pdf_bytes)
+
+    st.subheader("PDF Metadata")
+    st.text(metadata_str or "No metadata found")
+
+    with st.expander("Show Extracted Text"):
+        st.text(full_text[:5000])  # Show first 5000 chars for performance
+
+    if question:
+        chunks = chunk_text_with_overlap(full_text, chunk_size=500, overlap=50)
+        embeddings = embed_chunks(chunks)
+        index = build_faiss_index(embeddings)
+        relevant_chunks = get_relevant_chunks(question, chunks, embeddings, index, top_k=3)
+        context = "\n---\n".join(relevant_chunks)
+
+        # Generate answer from LLM with context
+        answer = None
+        try:
+            prompt = f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"
+            result = generator(prompt, max_length=256, num_return_sequences=1)
+            generated_text = result[0]['generated_text']
+            answer = generated_text[len(prompt):].strip()
+        except Exception as e:
+            answer = f"Error generating answer: {e}"
+
+        st.markdown("### Answer:")
+        st.write(answer)
+
+    if st.button("Generate Summary of Document"):
+        try:
+            summary = summarizer(full_text, max_length=200, min_length=80, do_sample=False)
+            st.markdown("### Summary")
+            st.write(summary[0]['summary_text'])
+        except Exception as e:
+            st.error(f"Error generating summary: {e}")
 
